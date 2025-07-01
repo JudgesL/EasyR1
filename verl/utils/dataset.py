@@ -87,6 +87,7 @@ class RLHFDataset(Dataset):
         data_path: str,
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
+        system_key: str = "system",
         prompt_key: str = "prompt",
         answer_key: str = "answer",
         image_key: str = "images",
@@ -100,6 +101,7 @@ class RLHFDataset(Dataset):
     ):
         self.tokenizer = tokenizer
         self.processor = processor
+        self.system_key = system_key
         self.prompt_key = prompt_key
         self.answer_key = answer_key
         self.image_key = image_key
@@ -140,6 +142,11 @@ class RLHFDataset(Dataset):
             format_prompt = Template(self.format_prompt.strip())
             prompt_str = format_prompt.render(content=prompt_str)
 
+        messages = []
+        
+        if self.system_key in example:
+            messages.append({"role":"system", "content": example[self.system_key]})
+
         if self.image_key in example:
             # https://huggingface.co/docs/transformers/en/tasks/image_text_to_text
             content_list = []
@@ -149,10 +156,11 @@ class RLHFDataset(Dataset):
 
                 if content:
                     content_list.append({"type": "text", "text": content})
-
-            return [{"role": "user", "content": content_list}]
+            messages.append({"role": "user", "content": content_list})
         else:
-            return [{"role": "user", "content": prompt_str}]
+            messages.append({"role": "user", "content": prompt_str})
+        
+        return messages
 
     def _filter_overlong_prompts(self, example: Dict[str, Any]) -> bool:
         messages = self._build_messages(example)
