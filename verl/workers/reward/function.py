@@ -171,7 +171,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         """
         将模型输出格式
         【卡片标题】：{title}
-        【问题】：{question}
+        【要点】：{question}
         【回答】：{answer}
         转换为 reward 可接受的格式：
         [SEP]{title}[SEP]{question}[SEP]{answer}
@@ -181,7 +181,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         text = model_output.replace('\n', '')
         # 替换字段
         text = text.replace('【卡片标题】：', '[SEP]')
-        text = text.replace('【问题】：', '[SEP]')
+        text = text.replace('【要点】：', '[SEP]')
         text = text.replace('【回答】：', '[SEP]')
         # 保证第一个[SEP]前面没有内容
         if not text.startswith('[SEP]'):
@@ -192,7 +192,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         """
         将模型输出格式
         【卡片标题】：{title}
-        【问题】：{question}
+        【要点】：{question}
         【回答】：{answer}
         参考信息格式：
         pagetitle__bidword
@@ -206,8 +206,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         for line in model_output.split('\n'):
             if line.startswith('【卡片标题】：'):
                 title = line.replace('【卡片标题】：', '').strip()
-            elif line.startswith('【问题】：'):
-                question = line.replace('【问题】：', '').strip()
+            elif line.startswith('【要点】：'):
+                question = line.replace('【要点】：', '').strip()
             elif line.startswith('【回答】：'):
                 answer = line.replace('【回答】：', '').strip()
         # 解析参考信息
