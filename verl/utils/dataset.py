@@ -90,6 +90,7 @@ class RLHFDataset(Dataset):
         system_key: str = "system",
         prompt_key: str = "prompt",
         answer_key: str = "answer",
+        refer_message: str = "refer_message",
         image_key: str = "images",
         image_dir: Optional[str] = None,
         max_prompt_length: int = 1024,
@@ -104,6 +105,7 @@ class RLHFDataset(Dataset):
         self.system_key = system_key
         self.prompt_key = prompt_key
         self.answer_key = answer_key
+        self.refer_message = refer_message
         self.image_key = image_key
         self.image_dir = image_dir
         self.max_prompt_length = max_prompt_length
@@ -239,4 +241,5 @@ class RLHFDataset(Dataset):
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
         example["ground_truth"] = example.pop(self.answer_key)
+        example["refer_message"] = example.pop(self.refer_message)
         return example

@@ -24,9 +24,13 @@ from typing import Optional
 class RewardConfig:
     reward_type: str = "batch"
     reward_function: Optional[str] = None
+    reward_model_path: Optional[str] = None
     reward_function_kwargs: dict = field(default_factory=dict)
     skip_special_tokens: bool = True
     num_cpus: int = 1
+    reward_model_weight: float = 0.5
+    reward_model_batch_size: int = 1024
+
     # below are auto keys
     reward_function_name: Optional[str] = field(default=None, init=False)
 

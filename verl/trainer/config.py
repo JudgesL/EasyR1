@@ -38,6 +38,7 @@ class DataConfig:
     system_key: str = "system"
     prompt_key: str = "prompt"
     answer_key: str = "answer"
+    refer_message: str = "refer_message"
     image_key: str = "images"
     image_dir: Optional[str] = None
     max_prompt_length: int = 512

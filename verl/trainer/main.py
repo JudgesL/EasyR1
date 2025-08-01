@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import json
+import os
+import torch
 
 import ray
 from omegaconf import OmegaConf
@@ -20,7 +22,7 @@ from omegaconf import OmegaConf
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
-from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager
+from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager, HybridLLMRuleRewardManager
 from .config import PPOConfig
 from .data_loader import create_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
@@ -57,7 +59,7 @@ class Runner:
         }
         global_pool_id = "global_pool"
         resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            global_pool_id: [config.trainer.n_gpus_per_node - 1] * config.trainer.nnodes,
         }
         mapping = {
             Role.ActorRolloutRef: global_pool_id,
@@ -69,12 +71,15 @@ class Runner:
             RewardManager = SequentialFunctionRewardManager
         elif config.worker.reward.reward_type == "batch":
             RewardManager = BatchFunctionRewardManager
+        elif config.worker.reward.reward_type == "hybrid":
+            RewardManager = HybridLLMRuleRewardManager
         else:
             raise NotImplementedError(f"Unknown reward type {config.worker.reward.reward_type}.")
 
-        RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus)
+        RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus, num_gpus=config.trainer.nnodes)
         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
-        val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+        # val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+        val_reward_fn = reward_fn  # 复用同一个Actor
 
         train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
 
@@ -104,6 +109,9 @@ def main():
         default_config = OmegaConf.merge(default_config, file_config)
 
     ppo_config = OmegaConf.merge(default_config, cli_args)
+    ppo_config.trainer.nnodes = os.getenv("NNODES", "1")
+    ppo_config.trainer.n_gpus_per_node = torch.cuda.device_count()
+
     ppo_config: PPOConfig = OmegaConf.to_object(ppo_config)
     ppo_config.deep_post_init()
 

@@ -31,22 +31,22 @@ if is_package_available("swanlab"):
 @dataclass
 class GenerationLogger(ABC):
     @abstractmethod
-    def log(self, samples: List[Tuple[str, str, str, float]], step: int) -> None: ...
+    def log(self, samples: List[Tuple[str, str, str, str, float]], step: int) -> None: ...
 
 
 @dataclass
 class ConsoleGenerationLogger(GenerationLogger):
-    def log(self, samples: List[Tuple[str, str, str, float]], step: int) -> None:
-        for inp, out, lab, score in samples:
-            print(f"[prompt] {inp}\n[output] {out}\n[ground_truth] {lab}\n[score] {score}\n")
+    def log(self, samples: List[Tuple[str, str, str, str, float]], step: int) -> None:
+        for inp, out, lab, ref, score in samples:
+            print(f"[prompt] {inp}\n[output] {out}\n[ground_truth] {lab}\n[refer_message] {ref}\n [score] {score}\n")
 
 
 @dataclass
 class WandbGenerationLogger(GenerationLogger):
-    def log(self, samples: List[Tuple[str, str, str, float]], step: int) -> None:
+    def log(self, samples: List[Tuple[str, str, str, str, float]], step: int) -> None:
         # Create column names for all samples
         columns = ["step"] + sum(
-            [[f"input_{i + 1}", f"output_{i + 1}", f"label_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))],
+            [[f"input_{i + 1}", f"output_{i + 1}", f"label_{i + 1}", f"refer_message_{i + 1}", f"score_{i + 1}"] for i in range(len(samples))],
             [],
         )
 
@@ -70,11 +70,11 @@ class WandbGenerationLogger(GenerationLogger):
 
 @dataclass
 class SwanlabGenerationLogger(GenerationLogger):
-    def log(self, samples: List[Tuple[str, str, str, float]], step: int) -> None:
+    def log(self, samples: List[Tuple[str, str, str, str, float]], step: int) -> None:
         swanlab_text_list = []
         for i, sample in enumerate(samples):
             row_text = "\n\n---\n\n".join(
-                (f"input: {sample[0]}", f"output: {sample[1]}", f"label: {sample[2]}", f"score: {sample[3]}")
+                (f"input: {sample[0]}", f"output: {sample[1]}", f"label: {sample[2]}", f"refer_message: {sample[3]}", f"score: {sample[4]}")
             )
             swanlab_text_list.append(swanlab.Text(row_text, caption=f"sample {i + 1}"))
 
@@ -97,6 +97,6 @@ class AggregateGenerationsLogger:
             if logger in GEN_LOGGERS:
                 self.loggers.append(GEN_LOGGERS[logger]())
 
-    def log(self, samples: List[Tuple[str, str, str, float]], step: int) -> None:
+    def log(self, samples: List[Tuple[str, str, str, str, float]], step: int) -> None:
         for logger in self.loggers:
             logger.log(samples, step)

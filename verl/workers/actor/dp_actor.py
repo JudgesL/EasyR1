@@ -199,13 +199,33 @@ class DataParallelPPOActor(BasePPOActor):
         if self.rank == 0:
             micro_batches = tqdm(micro_batches, desc="Compute log probs", position=1)
 
-        for micro_batch in micro_batches:
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
-            log_probs_lst.append(log_probs)
+        print_debug_log = 0
+        if print_debug_log:
+            for i, micro_batch in enumerate(micro_batches):
+                try:
+                    bs = micro_batch.batch['input_ids'].shape if 'input_ids' in micro_batch.batch else 'N/A'
+                    print(f"[DEBUG] {i+1}: start, batch size={bs}")
+                    model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    print(f"[DEBUG] {i+1}: model_inputs ready")
+                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                    print(f"[DEBUG] {i+1}: forward done, log_probs shape={log_probs.shape}")
+                    log_probs_lst.append(log_probs)
+                except Exception as e:
+                    print(f"[ERROR] Exception at step {i+1}: {e}")
+                    raise
 
-        log_probs = torch.concat(log_probs_lst, dim=0)
-        return log_probs
+            print("[DEBUG] for loop finished, start torch.concat")
+            log_probs = torch.concat(log_probs_lst, dim=0)
+            print(f"[DEBUG] torch.concat done, log_probs shape={log_probs.shape}")
+            return log_probs
+        else:
+            for micro_batch in micro_batches:
+                model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                log_probs_lst.append(log_probs)
+
+            log_probs = torch.concat(log_probs_lst, dim=0)
+            return log_probs
 
     def update_policy(self, data: DataProto) -> Dict[str, Any]:
         self.actor_module.train()
