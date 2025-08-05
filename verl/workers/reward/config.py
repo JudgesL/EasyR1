@@ -29,7 +29,11 @@ class RewardConfig:
     skip_special_tokens: bool = True
     num_cpus: int = 1
     reward_model_weight: float = 0.5
+    rule_weight: float = 0.5
+    diversity_weight: float = 0.5
     reward_model_batch_size: int = 1024
+    model_score_type: str = "ctcvr"
+    model_q_process: str = "log"
 
     # below are auto keys
     reward_function_name: Optional[str] = field(default=None, init=False)

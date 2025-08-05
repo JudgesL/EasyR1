@@ -23,10 +23,12 @@ from .model import QwenWithCTRCVR,BertWithCTRCVR
 import torch
 from transformers import PreTrainedTokenizer
 from transformers import AutoTokenizer
-
 from ...protocol import DataProto
 from .config import RewardConfig
-
+import jieba
+import math
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 class RewardInput(TypedDict):
     response: str
@@ -145,7 +147,11 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         print("[DEBUG] torch.cuda.is_available():", torch.cuda.is_available())
         print("[DEBUG] torch.cuda.device_count():", torch.cuda.device_count())
         self.reward_model_batch_size = getattr(config, "reward_model_batch_size", 1024)
-        self.alpha = getattr(config, "reward_model_weight", 0.5)
+        self.reword_weight = getattr(config, "reward_model_weight", 0.5)
+        self.rule_weight = getattr(config, "rule_weight", 0.5)
+        self.diversity_weight = getattr(config, "diversity_weight", 0.5)
+        self.model_score_type = getattr(config, "model_score_type", "ctcvr")
+        self.model_q_process = getattr(config, "model_q_process", "log")
         model_path = getattr(config, "reward_model_path", None)
         if model_path:
             print(f"[HybridLLMRuleRewardManager] Loading reward LLM from {model_path}")
@@ -167,39 +173,18 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             print("[HybridLLMRuleRewardManager] No LLM reward_model_path provided. Only rule-based reward will be used.")
             self.llm_tokenizer = None
             self.llm_model = None
-    def model_output_to_reward_input(self, model_output: str, refer_message: str) -> str:
-        """
-        将模型输出格式
-        【卡片标题】：{title}
-        【要点】：{question}
-        【回答】：{answer}
-        转换为 reward 可接受的格式：
-        [SEP]{title}[SEP]{question}[SEP]{answer}
-        并去除所有换行符
-        """
-        # 去除换行符
-        text = model_output.replace('\n', '')
-        # 替换字段
-        text = text.replace('【卡片标题】：', '[SEP]')
-        text = text.replace('【要点】：', '[SEP]')
-        text = text.replace('【回答】：', '[SEP]')
-        # 保证第一个[SEP]前面没有内容
-        if not text.startswith('[SEP]'):
-            text = '[SEP]' + text
-        return text
+
+    def jieba_tokenize(self, text):
+        return jieba.lcut(text)
     
-    def model_output_to_reward_input_qwen(self, model_output: str, refer_message: str) -> str:
+    def extract_model_output(self, model_output: str, refer_message: str) -> str:
         """
-        将模型输出格式
+        从模型输出的文本中提取出需要的信息，包括：
         【卡片标题】：{title}
         【要点】：{question}
         【回答】：{answer}
         参考信息格式：
         pagetitle__bidword
-        转换为 reward 可接受的格式：
-        f"你是一位精通用户心理与商业广告的专家，请你根据用户query和广告内容，预估用户是否会点击广告并发生转化。"
-                f"query:{pagetitle}，"
-                f"广告内容：广告拍卖词:{bidword}，广告标题「{title}」广告问答卡创意问「{ask_content}」回答「{answer_content}」"
         """
         # 解析卡片信息
         title, question, answer = '', '', ''
@@ -212,7 +197,18 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 answer = line.replace('【回答】：', '').strip()
         # 解析参考信息
         if '__' in refer_message:
-            pagetitle, bidword = refer_message.split('__', 1)
+            pagetitle, bidword  = refer_message.split('__', 1)
+        return title, question, answer, pagetitle, bidword
+    
+    def model_output_to_reward_input_qwen(self, title, question, answer, pagetitle, bidword) -> str:
+        """
+        参考信息格式：
+        pagetitle__bidword
+        转换为 reward 可接受的格式：
+        f"你是一位精通用户心理与商业广告的专家，请你根据用户query和广告内容，预估用户是否会点击广告并发生转化。"
+                f"query:{pagetitle}，"
+                f"广告内容：广告拍卖词:{bidword}，广告标题「{title}」广告问答卡创意问「{ask_content}」回答「{answer_content}」"
+        """
         # 拼接reward输入格式
         reward_input = (
             "你是一位精通用户心理与商业广告的专家，请你根据用户query和广告内容，预估用户是否会点击广告并发生转化。"
@@ -221,8 +217,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         )
         return reward_input
 
-    def calc_overall_reward(self, rule_score, model_score):
-        return self.alpha * model_score + (1 - self.alpha) * rule_score
+    def calc_overall_reward(self, rule_score, model_score, diversity_score):
+        return self.reword_weight * model_score + self.rule_weight * rule_score + self.diversity_weight * diversity_score
 
     def get_model_score(self, response_str):
         inputs = self.llm_tokenizer(
@@ -257,6 +253,9 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         rule_scores = []
         reward_model_inputs = []
         all_rule_score_dicts = []
+        titles = []
+        questions = []
+        answers = []
         for i in range(batch_size):
             valid_response_ids = response_ids[i][: response_length[i]]
             response_str = self.tokenizer.decode(
@@ -275,13 +274,19 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             rule_scores.append(rule_score)
             all_rule_score_dicts.append(rule_score_dict)  # 保存全部
 
-            # 为模型推理准备输入
+            # 为模型推理、多样性奖励准备输入
             if self.llm_model is not None:
-                reward_input = self.model_output_to_reward_input_qwen(response_str, refer_msg)
-                # print(f"reward model input prepared: {reward_input}")
+                title, question, answer, pagetitle, bidword = self.extract_model_output(response_str, refer_msg)
+                reward_input = self.model_output_to_reward_input_qwen(title, question, answer, pagetitle, bidword)
                 reward_model_inputs.append(reward_input)
+                titles.append(title)
+                questions.append(question)
+                answers.append(answer)
             else:
                 reward_model_inputs.append(None)
+                titles.append(None)
+                questions.append(None)
+                answers.append(None)
 
             log(f"sample {i}: rule_score={rule_score}, response_len={int(response_length[i])}")
 
@@ -308,23 +313,75 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                     with torch.no_grad():
                         out = self.llm_model(**enc)
                         batch_ctr_scores = out.logits[:, 0].cpu().tolist()
-                    for idx, score in zip(batch_indices, batch_ctr_scores):
-                        model_scores[idx] = score
-                        log(f"sample {idx}: model_score={score}")
+                        batch_ctcvr_scores = out.logits[:, 1].cpu().tolist()
+                    if self.model_score_type == "ctcvr":
+                        for idx, score in zip(batch_indices, batch_ctcvr_scores):
+                            if self.model_q_process == "log":
+                                model_scores[idx] = math.log(max(score, 0.0) + 1.0)
+                            else:
+                                model_scores[idx] = score
+                            log(f"sample {idx}: model_score={score}")
+                    else:
+                        for idx, score in zip(batch_indices, batch_ctr_scores):
+                            if self.model_q_process == "log":
+                                model_scores[idx] = math.log(max(score, 0.0) + 1.0)
+                            else:
+                                model_scores[idx] = score
+                            log(f"sample {idx}: model_score={score}")
             else:
                 log("no valid model inputs, skip model scoring")
 
-        # Step 3: 计算 overall reward
+        # Step 3: 多样性奖励
+        tfidf_vectorizer = TfidfVectorizer(tokenizer=self.jieba_tokenize)
+        diversity_score_dicts = []  # 每个样本的多样性得分字典
+        if batch_size > 1:
+            title_tfidf_matrix = tfidf_vectorizer.fit_transform(titles)
+            question_tfidf_matrix = tfidf_vectorizer.fit_transform(questions)
+            answer_tfidf_matrix = tfidf_vectorizer.fit_transform(answers)
+            # 标题之间两两计算similarity
+            title_similarity_matrix = cosine_similarity(title_tfidf_matrix)
+            question_similarity_matrix = cosine_similarity(question_tfidf_matrix)
+            answer_similarity_matrix = cosine_similarity(answer_tfidf_matrix)
+            for i in range(batch_size):
+                # similarity_matrix[i] 是第 i 条 response 对所有 response 的相似度；
+                # similarity_matrix[i].sum() 是与所有 response 的相似度和；
+                # - 1.0 是去掉与自己相似度 1.0；/ (batch_size - 1) 是求平均相似度；1.0 - avg_sim 代表越不相似越高分（多样性越好）。
+                title_similarity = (title_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
+                question_similarity = (question_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
+                answer_similarity = (answer_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
+               # 多样性 = 1 - 平均相似度
+                diversity_score_dicts.append({
+                    "title_diversity_score": 1.0 - title_similarity,
+                    "question_diversity_score": 1.0 - question_similarity,
+                    "answer_diversity_score": 1.0 - answer_similarity,
+                })
+        else:
+            # batch_size == 1 时，定义多样性得分为0.0
+            for _ in range(batch_size):
+                diversity_score_dicts.append({
+                    "title_diversity_score": 0.0,
+                    "question_diversity_score": 0.0,
+                    "answer_diversity_score": 0.0,
+                })
+
+        # Step 4: 计算 overall reward
         for i in range(batch_size):
-            overall = self.calc_overall_reward(rule_scores[i], model_scores[i])
+            overall = self.calc_overall_reward(rule_scores[i], model_scores[i], diversity_score_dicts[i])
             reward_tensor[i, response_length[i] - 1] = overall
             reward_metrics["overall"].append(overall)
             reward_metrics["rule_score"].append(rule_scores[i])
             reward_metrics["model_score"].append(model_scores[i])
+            # 加入 rule_score_dict 内容
             rule_score_dict = all_rule_score_dicts[i]
             for key, value in rule_score_dict.items():
                 if key not in ("overall",):  # overall已加
                     reward_metrics[key].append(value)
+
+            # 加入 diversity_score_dict 内容
+            diversity_score_dict = diversity_score_dicts[i]
+            for key, value in diversity_score_dict.items():
+                reward_metrics[key].append(value)
+
             log(f"sample {i}: overall={overall}")
 
         log(f"finished compute_reward, total_time={time.time() - start_time:.3f}s")
