@@ -315,11 +315,12 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                         batch_ctr_scores = out.logits[:, 0].cpu().tolist()
                         batch_ctcvr_scores = out.logits[:, 1].cpu().tolist()
                     if self.model_score_type == "ctcvr":
+                        # ctcvr数值过小，处理时先*100
                         for idx, score in zip(batch_indices, batch_ctcvr_scores):
                             if self.model_q_process == "log":
-                                model_scores[idx] = math.log(max(score, 0.0) + 1.0)
+                                model_scores[idx] = math.log(max(score * 100, 0.0) + 1.0)
                             else:
-                                model_scores[idx] = score
+                                model_scores[idx] = score * 100
                             log(f"sample {idx}: model_score={score}")
                     else:
                         for idx, score in zip(batch_indices, batch_ctr_scores):
@@ -349,24 +350,27 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 title_similarity = (title_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
                 question_similarity = (question_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
                 answer_similarity = (answer_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
-               # 多样性 = 1 - 平均相似度
-                diversity_score_dicts.append({
+                # 多样性 = 1 - 平均相似度
+                diversity_dict = {
                     "title_diversity_score": 1.0 - title_similarity,
                     "question_diversity_score": 1.0 - question_similarity,
                     "answer_diversity_score": 1.0 - answer_similarity,
-                })
+                }
+                diversity_score_dicts.append(diversity_dict)
         else:
             # batch_size == 1 时，定义多样性得分为0.0
             for _ in range(batch_size):
-                diversity_score_dicts.append({
+                diversity_dict = {
                     "title_diversity_score": 0.0,
                     "question_diversity_score": 0.0,
                     "answer_diversity_score": 0.0,
-                })
+                }
+                diversity_score_dicts.append(diversity_dict)
 
         # Step 4: 计算 overall reward
         for i in range(batch_size):
-            overall = self.calc_overall_reward(rule_scores[i], model_scores[i], diversity_score_dicts[i])
+            diversity_score = (diversity_score_dicts[i]["answer_diversity_score"] + diversity_score_dicts[i]["question_diversity_score"] + diversity_score_dicts[i]["title_diversity_score"]) / 3
+            overall = self.calc_overall_reward(rule_scores[i], model_scores[i], diversity_score)
             reward_tensor[i, response_length[i] - 1] = overall
             reward_metrics["overall"].append(overall)
             reward_metrics["rule_score"].append(rule_scores[i])
