@@ -352,24 +352,24 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 answer_similarity = (answer_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
                 # 多样性 = 1 - 平均相似度
                 diversity_dict = {
-                    "title_diversity_score": 1.0 - title_similarity,
-                    "question_diversity_score": 1.0 - question_similarity,
-                    "answer_diversity_score": 1.0 - answer_similarity,
+                    "[Diversity]title_diversity_score": 1.0 - title_similarity,
+                    "[Diversity]question_diversity_score": 1.0 - question_similarity,
+                    "[Diversity]answer_diversity_score": 1.0 - answer_similarity,
                 }
                 diversity_score_dicts.append(diversity_dict)
         else:
             # batch_size == 1 时，定义多样性得分为0.0
             for _ in range(batch_size):
                 diversity_dict = {
-                    "title_diversity_score": 0.0,
-                    "question_diversity_score": 0.0,
-                    "answer_diversity_score": 0.0,
+                    "[Diversity]title_diversity_score": 0.0,
+                    "[Diversity]question_diversity_score": 0.0,
+                    "[Diversity]answer_diversity_score": 0.0,
                 }
                 diversity_score_dicts.append(diversity_dict)
 
         # Step 4: 计算 overall reward
         for i in range(batch_size):
-            diversity_score = (diversity_score_dicts[i]["answer_diversity_score"] + diversity_score_dicts[i]["question_diversity_score"] + diversity_score_dicts[i]["title_diversity_score"]) / 3
+            diversity_score = (diversity_score_dicts[i]["[Diversity]answer_diversity_score"] + diversity_score_dicts[i]["[Diversity]question_diversity_score"] + diversity_score_dicts[i]["[Diversity]title_diversity_score"]) / 3
             overall = self.calc_overall_reward(rule_scores[i], model_scores[i], diversity_score)
             reward_tensor[i, response_length[i] - 1] = overall
             reward_metrics["overall"].append(overall)
