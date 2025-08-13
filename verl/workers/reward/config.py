@@ -34,6 +34,10 @@ class RewardConfig:
     reward_model_batch_size: int = 1024
     model_score_type: str = "ctcvr"
     model_q_process: str = "log"
+    n_gram_low_bound: int = 2
+    n_gram_up_bound: int = 5
+    n_gram_threshold: float = 0.15
+    ngram_penalty: float = 0.1
 
     # below are auto keys
     reward_function_name: Optional[str] = field(default=None, init=False)

@@ -29,6 +29,8 @@ import jieba
 import math
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+from collections import Counter
 
 class RewardInput(TypedDict):
     response: str
@@ -152,6 +154,10 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         self.diversity_weight = getattr(config, "diversity_weight", 0.5)
         self.model_score_type = getattr(config, "model_score_type", "ctcvr")
         self.model_q_process = getattr(config, "model_q_process", "log")
+        self.n_gram_low_bound= getattr(config, "n_gram_low_bound", 2)
+        self.n_gram_up_bound = getattr(config, "n_gram_up_bound", 5)
+        self.n_gram_threshold = getattr(config, "n_gram_threshold", 0.5)
+        self.ngram_penalty = getattr(config, "ngram_penalty", 0.1)
         model_path = getattr(config, "reward_model_path", None)
         if model_path:
             print(f"[HybridLLMRuleRewardManager] Loading reward LLM from {model_path}")
@@ -177,6 +183,58 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
     def jieba_tokenize(self, text):
         return jieba.lcut(text)
     
+    def get_ngrams(self, text, n):
+        return [text[i:i+n] for i in range(len(text)-n+1)]
+
+    def remove_specific_punctuation(self, text):
+        # 只去掉指定的标点符号
+        return re.sub(r'[、（）()，,。.!！;；“”‘’""\'\']', '', text)
+
+    def is_order_ngram(self, gram):
+        return any(order in gram for order in ["第一", "第二", "第三", "第四"])
+    
+    def merge_ngrams_longest_first(self, ngrams_set):
+        ngrams_list = sorted(list(ngrams_set), key=lambda x: len(x), reverse=True)
+        merged = []
+        for gram in ngrams_list:
+            if not any(gram in longer for longer in merged):
+                merged.append(gram)
+        return set(merged)
+    
+    def calc_high_freq_multi_ngram_penalty(self, batch_sentences, stopwords=None):
+        # 统计多个n-gram的高频
+        ngramed_sentences = []
+        for sent in batch_sentences:
+            clean_sent = self.remove_specific_punctuation(sent)
+            ngrams = []
+            for n in range(self.n_gram_low_bound, self.n_gram_up_bound+1):
+                ngrams.extend(self.get_ngrams(clean_sent, n))
+            if stopwords:
+                ngrams = [gram for gram in ngrams if not any(sw in gram for sw in stopwords)]
+            ngramed_sentences.append(ngrams)
+        batch_size = len(ngramed_sentences)
+
+        ngram_in_sentence = Counter()
+        for ngrams in ngramed_sentences:
+            for gram in set(ngrams):
+                ngram_in_sentence[gram] += 1
+
+        high_freq_ngrams = {gram for gram, cnt in ngram_in_sentence.items() if cnt / batch_size >= self.n_gram_threshold}
+
+        # 合并高频n-gram（长n-gram优先覆盖短n-gram）
+        merged_high_freq_ngrams = self.merge_ngrams_longest_first(high_freq_ngrams)
+        # 去除顺序词组
+        merged_high_freq_ngrams = {gram for gram in merged_high_freq_ngrams if not self.is_order_ngram(gram)}
+
+        penalties = []
+        for ngrams in ngramed_sentences:
+            unique_ngrams = set(ngrams)
+            penalty = sum(1 for gram in unique_ngrams if gram in merged_high_freq_ngrams) * self.ngram_penalty
+            penalties.append(penalty)
+
+        diversity_scores = [max(0.0, 1.0 - p) for p in penalties]
+        return diversity_scores, merged_high_freq_ngrams
+
     def extract_model_output(self, model_output: str, refer_message: str) -> str:
         """
         从模型输出的文本中提取出需要的信息，包括：
@@ -333,28 +391,19 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 log("no valid model inputs, skip model scoring")
 
         # Step 3: 多样性奖励
-        tfidf_vectorizer = TfidfVectorizer(tokenizer=self.jieba_tokenize)
         diversity_score_dicts = []  # 每个样本的多样性得分字典
         if batch_size > 1:
-            title_tfidf_matrix = tfidf_vectorizer.fit_transform(titles)
-            question_tfidf_matrix = tfidf_vectorizer.fit_transform(questions)
-            answer_tfidf_matrix = tfidf_vectorizer.fit_transform(answers)
-            # 标题之间两两计算similarity
-            title_similarity_matrix = cosine_similarity(title_tfidf_matrix)
-            question_similarity_matrix = cosine_similarity(question_tfidf_matrix)
-            answer_similarity_matrix = cosine_similarity(answer_tfidf_matrix)
+            diversity_scores_t, merged_high_freq_ngrams_t = self.calc_high_freq_multi_ngram_penalty(titles)
+            print("the patterns in title will be punished" , merged_high_freq_ngrams_t)
+            diversity_scores_q, merged_high_freq_ngrams_q = self.calc_high_freq_multi_ngram_penalty(questions)
+            print("the patterns in question will be punished" , merged_high_freq_ngrams_q)
+            diversity_scores_a, merged_high_freq_ngrams_a = self.calc_high_freq_multi_ngram_penalty(answers)
+            print("the patterns in answer will be punished" , merged_high_freq_ngrams_a)
             for i in range(batch_size):
-                # similarity_matrix[i] 是第 i 条 response 对所有 response 的相似度；
-                # similarity_matrix[i].sum() 是与所有 response 的相似度和；
-                # - 1.0 是去掉与自己相似度 1.0；/ (batch_size - 1) 是求平均相似度；1.0 - avg_sim 代表越不相似越高分（多样性越好）。
-                title_similarity = (title_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
-                question_similarity = (question_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
-                answer_similarity = (answer_similarity_matrix[i].sum() - 1.0) / (batch_size - 1)
-                # 多样性 = 1 - 平均相似度
                 diversity_dict = {
-                    "[Diversity]title_diversity_score": 1.0 - title_similarity,
-                    "[Diversity]question_diversity_score": 1.0 - question_similarity,
-                    "[Diversity]answer_diversity_score": 1.0 - answer_similarity,
+                    "[Diversity]title_diversity_score":  diversity_scores_t[i],
+                    "[Diversity]question_diversity_score": diversity_scores_q[i],
+                    "[Diversity]answer_diversity_score": diversity_scores_a[i],
                 }
                 diversity_score_dicts.append(diversity_dict)
         else:
