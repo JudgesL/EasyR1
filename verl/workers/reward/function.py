@@ -350,6 +350,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
         # Step 2: batch 模型推理
         model_scores = [0.0] * batch_size
+        ctr_predict = [0.0] * batch_size
+        cvr_predict = [0.0] * batch_size
         if self.llm_model is not None:
             valid_indices_and_inputs = [(i, x) for i, x in enumerate(reward_model_inputs) if x is not None]
             if valid_indices_and_inputs:
@@ -372,6 +374,12 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                         out = self.llm_model(**enc)
                         batch_ctr_scores = out.logits[:, 0].cpu().tolist()
                         batch_ctcvr_scores = out.logits[:, 1].cpu().tolist()
+                        for idx, score in zip(batch_indices, batch_ctr_scores):
+                            ctr_predict[idx] = score
+                        for idx, score in zip(batch_indices, batch_ctcvr_scores):
+                            # cvr = ctcvr/ctr
+                            if ctr_predict[idx] != 0:
+                                cvr_predict[idx] = score / ctr_predict[idx]
                     if self.model_score_type == "ctcvr":
                         # ctcvr数值过小，处理时先*100
                         for idx, score in zip(batch_indices, batch_ctcvr_scores):
@@ -424,6 +432,9 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             reward_metrics["overall"].append(overall)
             reward_metrics["rule_score"].append(rule_scores[i])
             reward_metrics["model_score"].append(model_scores[i])
+            reward_metrics["diversity_score"].append(diversity_score)
+            reward_metrics["ctr_predict"].append(ctr_predict[i])
+            reward_metrics["cvr_predict"].append(cvr_predict[i])
             # 加入 rule_score_dict 内容
             rule_score_dict = all_rule_score_dicts[i]
             for key, value in rule_score_dict.items():
