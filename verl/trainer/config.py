@@ -94,6 +94,8 @@ class AlgorithmConfig:
     """target kl for adaptive kl controller"""
     online_filtering: bool = False
     """use online filtering"""
+    use_token_level_reward: bool = False
+    """use token level reward"""
 
 
 @dataclass

@@ -25,6 +25,7 @@ class RewardConfig:
     reward_type: str = "batch"
     reward_function: Optional[str] = None
     reward_model_path: Optional[str] = None
+    black_list_path: Optional[str] = None
     reward_function_kwargs: dict = field(default_factory=dict)
     skip_special_tokens: bool = True
     num_cpus: int = 1

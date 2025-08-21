@@ -159,6 +159,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         self.n_gram_threshold = getattr(config, "n_gram_threshold", 0.5)
         self.ngram_penalty = getattr(config, "ngram_penalty", 0.1)
         model_path = getattr(config, "reward_model_path", None)
+        black_list_path = getattr(config, "black_list_path", None)
         if model_path:
             print(f"[HybridLLMRuleRewardManager] Loading reward LLM from {model_path}")
             special_tokens_dict = {'additional_special_tokens': ['[SEP]']}
@@ -180,31 +181,169 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             self.llm_tokenizer = None
             self.llm_model = None
 
-    def jieba_tokenize(self, text):
-        return jieba.lcut(text)
-    
+        if black_list_path:
+            print(f"[HybridLLMRuleRewardManager] Loading black list from {black_list_path}")
+            with open(black_list_path, 'r', encoding='gbk') as f:
+                self.black_list = set([line.strip() for line in f])
+        else:
+            print("[HybridLLMRuleRewardManager] No black list path provided.")
+            self.black_list = None
+
+
+    def map_char_rewards_to_tokens(self,
+        response_ids: torch.Tensor,
+        tokenizer: PreTrainedTokenizer,
+        response_str: str,
+        char_rewards: List[float],
+    ) -> torch.Tensor:
+        """
+        将“逐字符（char-level）分数”映射为“逐 token 分数”。                                                          
+
+        约定与保证：
+        - char_rewards 的长度必须等于 response_str 的字符长度（Python 字符串的 len 计数）。
+        - 返回的向量长度与 response_ids 完全相同；对特殊 token（BOS/EOS/PAD 等）填 0。
+        - 对于覆盖多字符的 token，将其覆盖区间内的字符分数取平均值。
+
+        参数:
+            response_ids: torch.Tensor
+                单条响应的 token id 序列（建议传入有效部分，形如 [T1, T2, ..., Tn]）。
+            tokenizer: PreTrainedTokenizer
+                与生成 response_ids 相同的 tokenizer。
+            response_str: str
+                该响应解码后的完整明文（和你打分的对象一致）。
+            char_rewards: List[float]
+                与 response_str 等长的分数序列（每个字符一个分数）。
+
+        返回:
+            torch.Tensor
+                与 response_ids 等长的 token 级分数张量，dtype=float32，device 与 response_ids 相同。
+        """
+        # ---------- 基本校验 ----------
+        # 保证字符级分数长度与明文长度完全一致，否则无法一一对应。
+        if len(response_str) != len(char_rewards):
+            raise ValueError(
+                f"[map_char_rewards_to_tokens] Length mismatch: "
+                f"len(response_str)={len(response_str)} vs len(char_rewards)={len(char_rewards)}"
+            )
+
+        device = response_ids.device
+        ids_list = response_ids.tolist()
+
+        # 输出张量，初始化为 0（对 special token 会保留为 0；普通 token 之后填平均分）
+        token_rewards = torch.zeros_like(response_ids, dtype=torch.float32)
+
+        # ---------- 标记特殊 token ----------
+        # special_mask: 与 ids_list 等长，特殊 token 位置为 1；普通 token 为 0
+        # already_has_special_tokens=True 表示 ids_list 可能包含 special，需要直接判断。
+        try:
+            special_mask = tokenizer.get_special_tokens_mask(
+                ids_list, already_has_special_tokens=True
+            )
+        except Exception:
+            # 某些自定义 tokenizer 可能不支持该函数；保守起见默认全为非特殊
+            special_mask = [0] * len(ids_list)
+
+        # 记录普通 token 的下标（需要写入分数的位置）
+        non_special_indices = [i for i, m in enumerate(special_mask) if m == 0]
+
+        # ---------- Fast 路径：使用 offset mapping ----------
+        # 条件：tokenizer 为 Fast 版本（底层为 tokenizers 库），支持返回每个 token 对应的字符区间
+        used_fast_path = False
+        if getattr(tokenizer, "is_fast", False):
+            try:
+                # 对 response_str 重新分词，且不引入任何 special tokens
+                # 这样得到的 input_ids 和 offset_mapping 是原始明文的纯文本切分
+                enc = tokenizer(
+                    response_str,
+                    add_special_tokens=False,
+                    return_offsets_mapping=True
+                )
+                text_token_ids = enc["input_ids"]                # 纯文本 token id 序列
+                offsets = enc["offset_mapping"]                  # 每个 token 对应的 (start, end) 字符下标（左闭右开）
+
+                # 将每个文本 token 的字符区间分数取平均
+                text_token_rewards: List[float] = []
+                for (start, end) in offsets:
+                    if end > start:
+                        # 平均该区间内的字符分数；注意这里的切片是基于 Python 字符的下标
+                        span = char_rewards[start:end]
+                        text_token_rewards.append(float(sum(span)) / (end - start))
+                    else:
+                        # 部分 tokenizer 可能产生零宽 token（极少见）；安全起见置 0
+                        text_token_rewards.append(0.0)
+
+                # 将 response_ids 去掉 special 后得到的 id 序列，与 text_token_ids 对齐：
+                # 如果完全一致，说明两边切分一致，可直接把 text_token_rewards 写回到非特殊 token 位置。
+                non_special_ids = [ids_list[i] for i in non_special_indices]
+                if non_special_ids == text_token_ids:
+                    for out_pos, r in zip(non_special_indices, text_token_rewards):
+                        token_rewards[out_pos] = r
+                    used_fast_path = True
+                # 若不一致，说明重分词与原始 ids 有轻微差异（可能来自空白处理等），转入慢路径兜底。
+            except Exception:
+                # 某些 tokenizer/输入组合可能不支持 offsets；直接转慢路径
+                used_fast_path = False
+
+        # ---------- Slow 路径（兜底）：解码游标法 ----------
+        # 思路：逐 token 解码成字符串片段 piece，然后用一个 cursor 在 response_str 上滑动，
+        # 取与 piece 长度相等的字符分数做平均。这样无需 offsets，也能对齐大多数 BPE/SentencePiece 行为。
+        if not used_fast_path:
+            cursor = 0  # 指向 response_str 中尚未消费的起始位置
+            n_chars = len(response_str)
+
+            for idx, tid in enumerate(ids_list):
+                if special_mask[idx] == 1:
+                    # 特殊 token：保持 0 分并跳过
+                    token_rewards[idx] = 0.0
+                    continue
+
+                # 解码当前单个 token（skip_special_tokens=True 避免把特殊符号文本解出来）
+                piece = tokenizer.decode([tid], skip_special_tokens=True)
+
+                # 片段为空串的情况（偶尔会出现）：给 0 分，不移动光标
+                if not piece:
+                    token_rewards[idx] = 0.0
+                    continue
+
+                piece_len = len(piece)
+
+                # 理想情况下：response_str[cursor : cursor + piece_len] 恰好等于 piece。
+                # 为了保持 O(N) 线性时间，这里不做复杂的查找/对齐，仅按长度切分。
+                # 这在 GPT2 系列（空白以空格还原）、SentencePiece（'▁' 还原为空格）等常见 tokenizer 中可用。
+                start = cursor
+                end = min(cursor + piece_len, n_chars)
+
+                if start >= n_chars:
+                    # 安全保护：游标已到达尾部（这通常意味着上游长度不一致）
+                    token_rewards[idx] = 0.0
+                else:
+                    span = char_rewards[start:end]
+                    if span:
+                        token_rewards[idx] = float(sum(span)) / len(span)
+                    else:
+                        token_rewards[idx] = 0.0
+
+                # 按 piece 的可见字符长度推进游标
+                cursor = end
+
+            # 可选的健壮性检查（不抛错，只在你需要时日志提示）：
+            # if cursor != n_chars:
+            #     print(f"[map_char_rewards_to_tokens] Warning: cursor({cursor}) != len(response_str)({n_chars}).")
+
+        return token_rewards.to(device)
+
     def get_ngrams(self, text, n):
-        return [text[i:i+n] for i in range(len(text)-n+1)]
+        return [text[i:i + n] for i in range(len(text) - n + 1)]
 
     def remove_specific_punctuation(self, text):
-        # 只去掉指定的标点符号
         return re.sub(r'[、（）()，,。.!！;；“”‘’""\'\']', '', text)
 
     def is_order_ngram(self, gram):
         return any(order in gram for order in ["第一", "第二", "第三", "第四"])
     
-    def merge_ngrams_longest_first(self, ngrams_set):
-        ngrams_list = sorted(list(ngrams_set), key=lambda x: len(x), reverse=True)
-        merged = []
-        for gram in ngrams_list:
-            if not any(gram in longer for longer in merged):
-                merged.append(gram)
-        return set(merged)
-    
     def calc_high_freq_multi_ngram_penalty(self, batch_sentences, stopwords=None):
-        # 统计多个n-gram的高频
         ngramed_sentences = []
-        for sent in batch_sentences:
+        for (sent, start_idx) in batch_sentences:
             clean_sent = self.remove_specific_punctuation(sent)
             ngrams = []
             for n in range(self.n_gram_low_bound, self.n_gram_up_bound+1):
@@ -212,30 +351,108 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             if stopwords:
                 ngrams = [gram for gram in ngrams if not any(sw in gram for sw in stopwords)]
             ngramed_sentences.append(ngrams)
-        batch_size = len(ngramed_sentences)
 
+        batch_size = len(ngramed_sentences)
         ngram_in_sentence = Counter()
         for ngrams in ngramed_sentences:
             for gram in set(ngrams):
                 ngram_in_sentence[gram] += 1
 
-        high_freq_ngrams = {gram for gram, cnt in ngram_in_sentence.items() if cnt / batch_size >= self.n_gram_threshold}
-
-        # 合并高频n-gram（长n-gram优先覆盖短n-gram）
-        merged_high_freq_ngrams = self.merge_ngrams_longest_first(high_freq_ngrams)
+        high_freq_ngrams = {
+            gram: cnt / batch_size
+            for gram, cnt in ngram_in_sentence.items()
+            if cnt / batch_size >= 0.15  # 至少比最低阈值高才纳入打分
+        }
         # 去除顺序词组
-        merged_high_freq_ngrams = {gram for gram in merged_high_freq_ngrams if not self.is_order_ngram(gram)}
+        high_freq_ngrams = {
+            gram: ratio for gram, ratio in high_freq_ngrams.items()
+            if not self.is_order_ngram(gram)
+        }
+        return high_freq_ngrams  # dict: {gram:频率}
 
-        penalties = []
-        for ngrams in ngramed_sentences:
-            unique_ngrams = set(ngrams)
-            penalty = sum(1 for gram in unique_ngrams if gram in merged_high_freq_ngrams) * self.ngram_penalty
-            penalties.append(penalty)
+    def get_ngram_char_level_reward(self, extracted_sentence, high_freq_ngrams, char_score):
+        """
+        给句子中出现的高频 n-gram 打分。
+        high_freq_ngrams: dict[str, float] -> {ngram: ratio}
+        char_score: 全局字符分数向量
+        """
+        sent, idx = extracted_sentence
+        length = len(sent)
+        sent_score = [0.0] * length
 
-        diversity_scores = [max(0.0, 1.0 - p) for p in penalties]
-        return diversity_scores, merged_high_freq_ngrams
+        def score_from_ratio(ratio: float) -> float:
+            """根据 ratio 映射分数"""
+            if ratio > 0.25:
+                return -1.0
+            elif ratio > 0.20:
+                return -0.5
+            elif ratio > 0.15:
+                return -0.3
+            return 0.0
 
-    def extract_model_output(self, model_output: str, refer_message: str) -> str:
+        # 遍历 ngram
+        for gram, ratio in high_freq_ngrams.items():
+            gram_len = len(gram)
+            if gram_len == 0:
+                continue
+
+            gram_score = score_from_ratio(ratio)
+            if gram_score == 0.0:
+                continue  # 没有惩罚就跳过
+
+            # 在句子中查找所有位置
+            start = 0
+            while True:
+                pos = sent.find(gram, start)
+                if pos == -1:
+                    break
+                for k in range(gram_len):
+                    if pos + k < length:
+                        sent_score[pos + k] = min(sent_score[pos + k], gram_score)  # 保留 min
+                start = pos + 1
+
+        # 映射到全局 char_score
+        for i in range(length):
+            char_score[i + idx] += sent_score[i]
+
+        return char_score, sum(sent_score) / length + 1
+
+    def get_black_list_char_level_reward(self, extracted_sentence, char_score):
+        """
+        给句子中出现的黑名单词打分。
+        black_list: set/list[str] 黑名单词
+        char_score: 全局字符分数向量
+        """
+        sent, idx = extracted_sentence
+        length = len(sent)
+        sent_score = [0.0] * length
+
+        # 遍历每一个黑名单词
+        for gram in self.black_list:
+            gram_len = len(gram)
+            if gram_len == 0:
+                continue
+
+            # 在句子中查找所有出现位置
+            start = 0
+            while True:
+                pos = sent.find(gram, start)
+                if pos == -1:
+                    break
+                # 命中后，对应字符位置打 -1 分
+                for k in range(gram_len):
+                    if pos + k < length:
+                        sent_score[pos + k] -= 1.0
+                start = pos + 1  # 继续往后找
+
+        # 映射到全局 char_score
+        for i in range(length):
+            char_score[i + idx] += sent_score[i]
+
+        # 返回更新后的 char_score 和句子平均分（平移 +1 保证非负）
+        return char_score, sum(sent_score) / length + 1
+    
+    def extract_model_output(self, model_output: str, refer_message: str):
         """
         从模型输出的文本中提取出需要的信息，包括：
         【卡片标题】：{title}
@@ -243,20 +460,35 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         【回答】：{answer}
         参考信息格式：
         pagetitle__bidword
+
+        返回：
+            title, question, answer, pagetitle, bidword,
+            title_start, question_start, answer_start
         """
         # 解析卡片信息
         title, question, answer = '', '', ''
+        title_start, question_start, answer_start = -1, -1, -1
         for line in model_output.split('\n'):
             if line.startswith('【卡片标题】：'):
                 title = line.replace('【卡片标题】：', '').strip()
+                # 计算起始位置
+                find_str = f'【卡片标题】：{title}'
+                title_start = model_output.rfind(find_str) + len('【卡片标题】：')
             elif line.startswith('【要点】：'):
                 question = line.replace('【要点】：', '').strip()
+                find_str = f'【要点】：{question}'
+                question_start = model_output.rfind(find_str) + len('【要点】：')
             elif line.startswith('【回答】：'):
                 answer = line.replace('【回答】：', '').strip()
+                find_str = f'【回答】：{answer}' 
+                answer_start = model_output.rfind(find_str) + len('【回答】：')
+
         # 解析参考信息
+        pagetitle, bidword = '', ''
         if '__' in refer_message:
-            pagetitle, bidword  = refer_message.split('__', 1)
-        return title, question, answer, pagetitle, bidword
+            pagetitle, bidword = refer_message.split('__', 1)
+
+        return title, question, answer, pagetitle, bidword, title_start, question_start, answer_start
     
     def model_output_to_reward_input_qwen(self, title, question, answer, pagetitle, bidword) -> str:
         """
@@ -275,8 +507,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         )
         return reward_input
 
-    def calc_overall_reward(self, rule_score, model_score, diversity_score):
-        return self.reword_weight * model_score + self.rule_weight * rule_score + self.diversity_weight * diversity_score
+    def calc_overall_reward(self, rule_score, model_score):
+        return self.reword_weight * model_score + self.rule_weight * rule_score
 
     def get_model_score(self, response_str):
         inputs = self.llm_tokenizer(
@@ -314,11 +546,14 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         titles = []
         questions = []
         answers = []
+        char_rewards = []
         for i in range(batch_size):
             valid_response_ids = response_ids[i][: response_length[i]]
             response_str = self.tokenizer.decode(
                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
             )
+            char_reward = [0.0]*len(response_str)
+            char_rewards.append(char_reward)
 
             gt = data.non_tensor_batch["ground_truth"][i]
             refer_msg = data.non_tensor_batch["refer_message"][i]
@@ -334,12 +569,12 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
             # 为模型推理、多样性奖励准备输入
             if self.llm_model is not None:
-                title, question, answer, pagetitle, bidword = self.extract_model_output(response_str, refer_msg)
+                title, question, answer, pagetitle, bidword, title_start, question_start, answer_start = self.extract_model_output(response_str, refer_msg)
                 reward_input = self.model_output_to_reward_input_qwen(title, question, answer, pagetitle, bidword)
                 reward_model_inputs.append(reward_input)
-                titles.append(title)
-                questions.append(question)
-                answers.append(answer)
+                titles.append((title,title_start))
+                questions.append((question,question_start))
+                answers.append((answer,answer_start))
             else:
                 reward_model_inputs.append(None)
                 titles.append(None)
@@ -399,19 +634,28 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 log("no valid model inputs, skip model scoring")
 
         # Step 3: 多样性奖励
+        # 当前 char_rewards大小为(bts, len(response_str))
         diversity_score_dicts = []  # 每个样本的多样性得分字典
         if batch_size > 1:
-            diversity_scores_t, merged_high_freq_ngrams_t = self.calc_high_freq_multi_ngram_penalty(titles)
-            print("the patterns in title will be punished" , merged_high_freq_ngrams_t)
-            diversity_scores_q, merged_high_freq_ngrams_q = self.calc_high_freq_multi_ngram_penalty(questions)
-            print("the patterns in question will be punished" , merged_high_freq_ngrams_q)
-            diversity_scores_a, merged_high_freq_ngrams_a = self.calc_high_freq_multi_ngram_penalty(answers)
-            print("the patterns in answer will be punished" , merged_high_freq_ngrams_a)
+            # 提取n_grams
+            high_freq_ngrams_title = self.calc_high_freq_multi_ngram_penalty(titles)
+            print("the patterns in title will be punished" , high_freq_ngrams_title)
+            # high_freq_ngrams_question = self.calc_high_freq_multi_ngram_penalty(questions)
+            # print("the patterns in question will be punished" , high_freq_ngrams_question)
+            high_freq_ngrams_answer = self.calc_high_freq_multi_ngram_penalty(answers)
+            print("the patterns in answer will be punished" , high_freq_ngrams_answer)
+            # 进行token级别的reward赋值
+            # 下面的diversity的逻辑是扣分逻辑，所以这里先普+1
+            char_score = [a + 1.0 for a in char_score]
             for i in range(batch_size):
+                # 这里对句子级别的损失和char级别的损失都进行了返回
+                char_rewards[i], diversity_title = self.get_ngram_char_level_reward(titles[i], high_freq_ngrams_title, char_rewards[i])
+                # char_rewards[i], diversity_question = self.get_ngram_char_level_reward(questions[i], high_freq_ngrams_question, char_rewards[i])
+                char_rewards[i], diversity_answer = self.get_ngram_char_level_reward(answers[i], high_freq_ngrams_answer, char_rewards[i])
                 diversity_dict = {
-                    "[Diversity]title_diversity_score":  diversity_scores_t[i],
-                    "[Diversity]question_diversity_score": diversity_scores_q[i],
-                    "[Diversity]answer_diversity_score": diversity_scores_a[i],
+                    "[Diversity]title_diversity_score":  diversity_title,
+                    "[Diversity]question_diversity_score": 1.0,
+                    "[Diversity]answer_diversity_score": diversity_answer,
                 }
                 diversity_score_dicts.append(diversity_dict)
         else:
@@ -424,15 +668,52 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 }
                 diversity_score_dicts.append(diversity_dict)
 
+        # Step 4: 风控黑名单
+        black_score_dicts = [] 
+        if self.black_list:
+            if batch_size > 1:
+                # 进行token级别的reward赋值
+                # 下面的black list的逻辑是扣分逻辑，所以这里先普+1
+                char_score = [a + 1.0 for a in char_score]
+                for i in range(batch_size):
+                    # 这里对句子级别的损失和char级别的损失都进行了返回
+                    char_rewards[i], black_title = self.get_black_list_char_level_reward(titles[i], char_rewards[i])
+                    char_rewards[i], black_question = self.get_black_list_char_level_reward(questions[i], char_rewards[i])
+                    char_rewards[i], black_answer = self.get_black_list_char_level_reward(answers[i], char_rewards[i])
+                    black_dict = {
+                        "[Black]title_black_score":  black_title,
+                        "[Black]question_black_score": black_question,
+                        "[Black]answer_black_score": black_answer,
+                    }
+                    black_score_dicts.append(black_dict)
+            else:
+                # batch_size == 1 时，定义多样性得分为0.0
+                for _ in range(batch_size):
+                    black_score_dicts = {
+                        "[Black]title_black_score":  0.0,
+                        "[Black]question_black_score": 0.0,
+                        "[Black]answer_black_score": 0.0,
+                    }
+                    black_score_dicts.append(black_score_dicts)
+
         # Step 4: 计算 overall reward
         for i in range(batch_size):
             diversity_score = (diversity_score_dicts[i]["[Diversity]answer_diversity_score"] + diversity_score_dicts[i]["[Diversity]question_diversity_score"] + diversity_score_dicts[i]["[Diversity]title_diversity_score"]) / 3
-            overall = self.calc_overall_reward(rule_scores[i], model_scores[i], diversity_score)
-            reward_tensor[i, response_length[i] - 1] = overall
+            black_score = (black_score_dicts[i]["[Black]answer_black_score"] + black_score_dicts[i]["[Black]question_black_score"] + black_score_dicts[i]["[Black]title_black_score"]) / 3
+            overall = self.calc_overall_reward(rule_scores[i], model_scores[i])
+
+            if len(char_rewards) > 0:
+                token_rewards = self.map_char_rewards_to_tokens(
+                    valid_response_ids, self.tokenizer, response_str, char_rewards)
+                reward_tensor[i, :len(token_rewards)] = token_rewards + overall
+            else:
+                reward_tensor[i, response_length[i] - 1] = overall
+
             reward_metrics["overall"].append(overall)
             reward_metrics["rule_score"].append(rule_scores[i])
             reward_metrics["model_score"].append(model_scores[i])
             reward_metrics["diversity_score"].append(diversity_score)
+            reward_metrics["black_score"].append(black_score)
             reward_metrics["ctr_predict"].append(ctr_predict[i])
             reward_metrics["cvr_predict"].append(cvr_predict[i])
             # 加入 rule_score_dict 内容
