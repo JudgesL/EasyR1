@@ -22,26 +22,32 @@ from typing import Optional
 
 @dataclass
 class RewardConfig:
+    # basic
     reward_type: str = "batch"
     reward_function: Optional[str] = None
-    reward_model_path: Optional[str] = None
-    black_list_path: Optional[str] = None
     reward_function_kwargs: dict = field(default_factory=dict)
     skip_special_tokens: bool = True
     num_cpus: int = 1
-    reward_model_weight: float = 0.5
+    # reward weight
     rule_weight: float = 0.5
     diversity_weight: float = 0.5
     relevant_weight: float = 0.5
-    reward_model_batch_size: int = 1024
-    judge_model_batch_size: int = 256
+    # reward model
+    reward_model_path: Optional[str] = None
+    reward_model_weight: float = 0.5
     model_score_type: str = "ctcvr"
     model_q_process: str = "log"
+    reward_model_batch_size: int = 1024
+    # judge model
+    judge_model_path: Optional[str] = None
+    judge_model_batch_size: int = 256
+    # diversity
     n_gram_low_bound: int = 2
     n_gram_up_bound: int = 5
     n_gram_threshold: float = 0.15
     ngram_penalty: float = 0.1
-
+    # black list
+    black_list_path: Optional[str] = None
     # below are auto keys
     reward_function_name: Optional[str] = field(default=None, init=False)
 
