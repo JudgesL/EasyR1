@@ -32,7 +32,9 @@ class RewardConfig:
     reward_model_weight: float = 0.5
     rule_weight: float = 0.5
     diversity_weight: float = 0.5
+    relevant_weight: float = 0.5
     reward_model_batch_size: int = 1024
+    judge_model_batch_size: int = 256
     model_score_type: str = "ctcvr"
     model_q_process: str = "log"
     n_gram_low_bound: int = 2

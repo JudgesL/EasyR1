@@ -209,8 +209,7 @@ def compute_grpo_outcome_advantage_token(
         advantages: (torch.Tensor) shape: (bs, response_length)
         returns: (torch.Tensor) shape: (bs, response_length)
     """
-    # step 1: 计算 rollout 内的 token-level scores
-    # 这里每个 rollout 的 "分数集合" 仍然来自 sum，不改变 mean/std 逻辑
+    # step 1: 计算 rollout 内的 scores
     scores = token_level_rewards.mean(dim=-1)  # (bs,)
 
     id2score = defaultdict(list)
