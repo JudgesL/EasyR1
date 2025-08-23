@@ -32,6 +32,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import re
 from collections import Counter
 from .prompts import PROMPT_BASE
+from vllm import LLM, SamplingParams
 
 class RewardInput(TypedDict):
     response: str
@@ -205,13 +206,24 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
         if judge_model_path:
             print(f"[HybridLLMRuleRewardManager] Loading judge model from {judge_model_path}")
-            self.judge_tokenizer = AutoTokenizer.from_pretrained(judge_model_path)
-            self.judge_model = AutoModelForCausalLM.from_pretrained(
-                judge_model_path,
-                torch_dtype=torch.float16,
-                device_map="auto"
+            # self.judge_tokenizer = AutoTokenizer.from_pretrained(judge_model_path)
+            # self.judge_model = AutoModelForCausalLM.from_pretrained(
+            #     judge_model_path,
+            #     torch_dtype=torch.float16,
+            #     device_map="auto"
+            # )
+            # self.judge_model.eval()
+            self.judge_model = LLM(
+                model=judge_model_path,
+                dtype="float16",              # 推荐用float16提升速度
+                max_model_len=2048,           # 视需求调整
+                # trust_remote_code=True      # 有的模型需要
             )
-            self.judge_model.eval()
+            self.vllm_sampling_params = SamplingParams(
+                max_tokens=100,              # 你要生成的最大token数
+                temperature=0.5,
+                top_p=1.0,
+            )
         else:
             print("[HybridLLMRuleRewardManager] No judge model path provided.")
             self.judge_tokenizer = None
@@ -406,6 +418,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         sent, idx = extracted_sentence
         length = len(sent)
         sent_score = [0.0] * length
+        if length == 0:
+            return char_score, 0.0
 
         def score_from_ratio(ratio: float) -> float:
             """根据 ratio 映射分数"""
@@ -440,8 +454,19 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
         # 映射到全局 char_score
         for i in range(length):
-            char_score[i + idx] += sent_score[i]
-
+            global_idx = i + idx
+            # 如果出现问题，打印debug信息
+            if global_idx >= len(char_score):
+                print("[DEBUG] char_score out of range!")
+                print(f"  sent: {sent!r}")
+                print(f"  idx: {idx}")
+                print(f"  sent_score: {sent_score}")
+                print(f"  high_freq_ngrams: {high_freq_ngrams}")
+                print(f"  char_score(len={len(char_score)}): {char_score}")
+                print(f"  global_idx: {global_idx}, i: {i}")
+                return char_score, sum(sent_score) / length + 1
+            # 否则赋值
+            char_score[global_idx] += sent_score[i]
         return char_score, sum(sent_score) / length + 1
 
     def get_black_list_char_level_reward(self, extracted_sentence, char_score):
@@ -453,6 +478,9 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         sent, idx = extracted_sentence
         length = len(sent)
         sent_score = [0.0] * length
+
+        if length == 0:
+            return char_score, 0.0
 
         # 遍历每一个黑名单词
         for gram in self.black_list:
@@ -474,9 +502,20 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
         # 映射到全局 char_score
         for i in range(length):
-            char_score[i + idx] += sent_score[i]
-
-        # 返回更新后的 char_score 和句子平均分（平移 +1 保证非负）
+            global_idx = i + idx
+            # 如果出现问题，打印debug信息
+            if global_idx >= len(char_score):
+                print("[DEBUG] char_score out of range!")
+                print(f"  sent: {sent!r}")
+                print(f"  idx: {idx}")
+                print(f"  sent_score: {sent_score}")
+                print(f"  black_list: {self.black_list}")
+                print(f"  char_score(len={len(char_score)}): {char_score}")
+                print(f"  global_idx: {global_idx}, i: {i}")
+                return char_score, sum(sent_score) / length + 1
+            # 否则赋值
+            char_score[global_idx] += sent_score[i]
+        # 返回结果
         return char_score, sum(sent_score) / length + 1
     
     def extract_model_output(self, model_output: str, refer_message: str):
@@ -495,20 +534,23 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         # 解析卡片信息
         title, question, answer = '', '', ''
         title_start, question_start, answer_start = -1, -1, -1
+
+        offset = 0
         for line in model_output.split('\n'):
-            if line.startswith('【卡片标题】：'):
-                title = line.replace('【卡片标题】：', '').strip()
-                # 计算起始位置
-                find_str = f'【卡片标题】：{title}'
-                title_start = model_output.rfind(find_str) + len('【卡片标题】：')
-            elif line.startswith('【要点】：'):
-                question = line.replace('【要点】：', '').strip()
-                find_str = f'【要点】：{question}'
-                question_start = model_output.rfind(find_str) + len('【要点】：')
-            elif line.startswith('【回答】：'):
-                answer = line.replace('【回答】：', '').strip()
-                find_str = f'【回答】：{answer}' 
-                answer_start = model_output.rfind(find_str) + len('【回答】：')
+            line_stripped = line.strip()
+            if line_stripped.startswith('【卡片标题】：'):
+                title = line_stripped.replace('【卡片标题】：', '').strip()
+                pos = line.find(title)
+                title_start = offset + pos if pos != -1 and title else -1
+            elif line_stripped.startswith('【要点】：'):
+                question = line_stripped.replace('【要点】：', '').strip()
+                pos = line.find(question)
+                question_start = offset + pos if pos != -1 and question else -1
+            elif line_stripped.startswith('【回答】：'):
+                answer = line_stripped.replace('【回答】：', '').strip()
+                pos = line.find(answer)
+                answer_start = offset + pos if pos != -1 and answer else -1
+            offset += len(line) + 1  # +1 是换行符
 
         # 解析参考信息
         pagetitle, bidword = '', ''
@@ -516,7 +558,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             pagetitle, bidword = refer_message.split('__', 1)
 
         return title, question, answer, pagetitle, bidword, title_start, question_start, answer_start
-    
+
     def parse_relevance_output(self, text: str) -> dict:
         """
         解析 judge model 的输出文本，提取【相关性】分数（int）
@@ -525,10 +567,11 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         【相关性】：具体分数，如（0分、1分、2分、3分、4分、5分）
         【理由】：具体理由
         """
+        score = 0
         if not text:
-            return 0
+            return score
         # 提取相关性分数
-        score_match = re.search(r"【相关性】\s*[:：]\s*([0-5])分", text)
+        score_match = re.search(r"【相关性】\s*[:：]?\s*([0-5])分", text)
         if score_match:
             try:
                 score = int(score_match.group(1))
@@ -605,12 +648,15 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         questions = []
         answers = []
         char_rewards = []
+        response_str_list=[]
         for i in range(batch_size):
             valid_response_ids = response_ids[i][: response_length[i]]
             response_str = self.tokenizer.decode(
                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
             )
+            response_str_list.append(response_str)
             char_reward = [0.0]*len(response_str)
+            log(f"first,len of str:{len(response_str)}, and len of char_reward:{len(char_reward)}")
             char_rewards.append(char_reward)
 
             gt = data.non_tensor_batch["ground_truth"][i]
@@ -695,46 +741,67 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
         # Step 3: 相关性审核模型
         relevent_scores = [0.0] * batch_size
+        # 在 compute_reward 里
         if self.judge_model is not None:
+            # 只收集非 None 的样本
             valid_indices_and_prompts = [(i, p) for i, p in enumerate(judge_model_inputs) if p is not None]
             if valid_indices_and_prompts:
-                batch_size_ = self.judge_model_batch_size
-                for start in range(0, len(valid_indices_and_prompts), batch_size_):
-                    end = start + batch_size_
-                    batch = valid_indices_and_prompts[start:end]
-                    batch_indices = [idx for idx, _ in batch]
-                    batch_prompts = [p for _, p in batch]
-                    log(f"judge forward batch: {start}-{end}, size={len(batch_prompts)}")
+                batch_indices = [idx for idx, _ in valid_indices_and_prompts]
+                batch_prompts = [p for _, p in valid_indices_and_prompts]
+                log(f"judge forward batch: size={len(batch_prompts)}")
 
-                    enc = self.judge_tokenizer(
-                        batch_prompts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=2048,  # 保险起见，限制上下文长度
-                    )
-                    device = next(self.judge_model.parameters()).device
-                    enc = {k: v.to(device) for k, v in enc.items()}
+                outputs = self.judge_model.generate(batch_prompts, self.vllm_sampling_params)
+                # outputs: List[RequestOutput]，每个output.outputs[0].text是生成文本
 
-                    with torch.no_grad():
-                        gen = self.judge_model.generate(
-                            **enc,
-                            do_sample=False,
-                            temperature=0.0,
-                            max_new_tokens=4,
-                            pad_token_id=self.judge_tokenizer.eos_token_id,
-                        )
+                for idx, output in zip(batch_indices, outputs):
+                    t = output.outputs[0].text.strip()
+                    label = self.parse_relevance_output(t)  # 解析为具体分数
+                    try:
+                        relevent_scores[idx] = float(label) / 5
+                    except Exception as e:
+                        print(f"sample {idx}: judge_output={t}, label parse failed: {e}")
+                        relevent_scores[idx] = 0.0
+                    log(f"sample {idx}: judge_output={t}, label={label}")
+        # if self.judge_model is not None:
+        #     valid_indices_and_prompts = [(i, p) for i, p in enumerate(judge_model_inputs) if p is not None]
+        #     if valid_indices_and_prompts:
+        #         batch_size_ = self.judge_model_batch_size
+        #         for start in range(0, len(valid_indices_and_prompts), batch_size_):
+        #             end = start + batch_size_
+        #             batch = valid_indices_and_prompts[start:end]
+        #             batch_indices = [idx for idx, _ in batch]
+        #             batch_prompts = [p for _, p in batch]
+        #             log(f"judge forward batch: {start}-{end}, size={len(batch_prompts)}")
 
-                    # 解码新生成部分
-                    input_len = enc["input_ids"].size(1)
-                    gen_chunk = gen[:, input_len:]
-                    decoded = self.judge_tokenizer.batch_decode(gen_chunk, skip_special_tokens=True)
+        #             enc = self.judge_tokenizer(
+        #                 batch_prompts,
+        #                 return_tensors="pt",
+        #                 padding=True,
+        #                 truncation=True,
+        #                 max_length=2048,  # 保险起见，限制上下文长度
+        #             )
+        #             device = next(self.judge_model.parameters()).device
+        #             enc = {k: v.to(device) for k, v in enc.items()}
 
-                    for idx, text in zip(batch_indices, decoded):
-                        t = text.strip()
-                        label = self.parse_relevance_output(t)  # 解析为具体分数
-                        relevent_scores[idx] = float(label)/5
-                        log(f"sample {idx}: judge_output={t}, label={label}")
+        #             with torch.no_grad():
+        #                 gen = self.judge_model.generate(
+        #                     **enc,
+        #                     do_sample=False,
+        #                     temperature=0.0,
+        #                     max_new_tokens=4,
+        #                     pad_token_id=self.judge_tokenizer.eos_token_id,
+        #                 )
+
+        #             # 解码新生成部分
+        #             input_len = enc["input_ids"].size(1)
+        #             gen_chunk = gen[:, input_len:]
+        #             decoded = self.judge_tokenizer.batch_decode(gen_chunk, skip_special_tokens=True)
+
+        #             for idx, text in zip(batch_indices, decoded):
+        #                 t = text.strip()
+        #                 label = self.parse_relevance_output(t)  # 解析为具体分数
+        #                 relevent_scores[idx] = float(label)/5
+        #                 log(f"sample {idx}: judge_output={t}, label={label}")
             else:
                 log("no valid judge inputs, skip relevance scoring")
 
@@ -750,13 +817,16 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             high_freq_ngrams_answer = self.calc_high_freq_multi_ngram_penalty(answers)
             print("the patterns in answer will be punished" , high_freq_ngrams_answer)
             # 进行token级别的reward赋值
-            # 下面的diversity的逻辑是扣分逻辑，所以这里先普+1
-            char_score = [a + 1.0 for a in char_score]
             for i in range(batch_size):
+                # 下面的diversity的逻辑是扣分逻辑，所以这里先普+1
+                log(f"before process, len char_reward:{len(char_rewards[i])}, len str:{len(response_str_list[i])}")
+                char_rewards[i] = [a + 1.0 for a in char_rewards[i]]
+                log(f"after add, len char_reward:{len(char_rewards[i])}, len str:{len(response_str_list[i])}")
                 # 这里对句子级别的损失和char级别的损失都进行了返回
                 char_rewards[i], diversity_title = self.get_ngram_char_level_reward(titles[i], high_freq_ngrams_title, char_rewards[i])
                 # char_rewards[i], diversity_question = self.get_ngram_char_level_reward(questions[i], high_freq_ngrams_question, char_rewards[i])
                 char_rewards[i], diversity_answer = self.get_ngram_char_level_reward(answers[i], high_freq_ngrams_answer, char_rewards[i])
+                log(f"after diversity process, len char_reward:{len(char_rewards[i])}, len str:{len(response_str_list[i])}")
                 diversity_dict = {
                     "[Diversity]title_diversity_score":  diversity_title,
                     "[Diversity]question_diversity_score": 1.0,
@@ -778,13 +848,14 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         if self.black_list:
             if batch_size > 1:
                 # 进行token级别的reward赋值
-                # 下面的black list的逻辑是扣分逻辑，所以这里先普+1
-                char_score = [a + 1.0 for a in char_score]
                 for i in range(batch_size):
+                    # 下面的black list的逻辑是扣分逻辑，所以这里先普+1
+                    char_rewards[i] = [a + 1.0 for a in char_rewards[i]]
                     # 这里对句子级别的损失和char级别的损失都进行了返回
                     char_rewards[i], black_title = self.get_black_list_char_level_reward(titles[i], char_rewards[i])
                     char_rewards[i], black_question = self.get_black_list_char_level_reward(questions[i], char_rewards[i])
                     char_rewards[i], black_answer = self.get_black_list_char_level_reward(answers[i], char_rewards[i])
+                    log(f"after black list, len char_reward:{len(char_rewards[i])}, len str:{len(response_str_list[i])}")
                     black_dict = {
                         "[Black]title_black_score":  black_title,
                         "[Black]question_black_score": black_question,
@@ -806,13 +877,12 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             diversity_score = (diversity_score_dicts[i]["[Diversity]answer_diversity_score"] + diversity_score_dicts[i]["[Diversity]question_diversity_score"] + diversity_score_dicts[i]["[Diversity]title_diversity_score"]) / 3
             black_score = (black_score_dicts[i]["[Black]answer_black_score"] + black_score_dicts[i]["[Black]question_black_score"] + black_score_dicts[i]["[Black]title_black_score"]) / 3
             overall = self.calc_overall_reward(rule_scores[i], model_scores[i], relevent_scores[i])
-
-            if len(char_rewards) > 0:
-                token_rewards = self.map_char_rewards_to_tokens(
-                    valid_response_ids, self.tokenizer, response_str, char_rewards)
-                reward_tensor[i, :len(token_rewards)] = token_rewards + overall
-            else:
-                reward_tensor[i, response_length[i] - 1] = overall
+            # 重新取对应的valid_response_ids
+            valid_response_ids = response_ids[i][: response_length[i]]
+            token_rewards = self.map_char_rewards_to_tokens(
+                valid_response_ids, self.tokenizer, response_str_list[i], char_rewards[i])
+            token_rewards_tensor = torch.tensor(token_rewards, dtype=reward_tensor.dtype, device=reward_tensor.device)
+            reward_tensor[i, :len(token_rewards)] = token_rewards_tensor + overall
 
             reward_metrics["overall"].append(overall)
             reward_metrics["rule_score"].append(rule_scores[i])
