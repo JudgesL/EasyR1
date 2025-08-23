@@ -231,7 +231,6 @@ def compute_grpo_outcome_advantage_token(
         mean = id2mean[index[i]]
         std = id2std[index[i]]
         advantages[i] = (token_level_rewards[i] - mean) / (std + eps)
-        print(advantages[i])
 
     # mask 掉 padding 部分
     advantages = advantages * response_mask

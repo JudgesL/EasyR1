@@ -37,6 +37,8 @@ class Runner:
         # print config
         print(json.dumps(config.to_dict(), indent=2))
 
+        reward_gpus = 2
+
         # instantiate tokenizer
         tokenizer = get_tokenizer(
             config.worker.actor.model.model_path,
@@ -59,7 +61,7 @@ class Runner:
         }
         global_pool_id = "global_pool"
         resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node - 1] * config.trainer.nnodes,
+            global_pool_id: [config.trainer.n_gpus_per_node - reward_gpus] * config.trainer.nnodes,
         }
         mapping = {
             Role.ActorRolloutRef: global_pool_id,
@@ -76,7 +78,7 @@ class Runner:
         else:
             raise NotImplementedError(f"Unknown reward type {config.worker.reward.reward_type}.")
 
-        RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus, num_gpus=config.trainer.nnodes)
+        RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus, num_gpus=reward_gpus)
         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
         # val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
         val_reward_fn = reward_fn  # 复用同一个Actor

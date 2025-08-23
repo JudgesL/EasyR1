@@ -174,19 +174,44 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
         # 黑名单相关
         black_list_path = getattr(config, "black_list_path", None)
-        
+        # 先启动VLLM，并保证其先用掉1张卡，不然VLLM会自动用掉所有的卡
+        if judge_model_path:
+            print(f"[HybridLLMRuleRewardManager] Loading judge model from {judge_model_path}")
+            # self.judge_tokenizer = AutoTokenizer.from_pretrained(judge_model_path)
+            # self.judge_model = AutoModelForCausalLM.from_pretrained(
+            #     judge_model_path,
+            #     torch_dtype=torch.float16,
+            #     device_map="auto"
+            # )
+            # self.judge_model.eval()
+            self.judge_model = LLM(
+                model=judge_model_path,
+                dtype="float16",              # 推荐用float16提升速度
+                tensor_parallel_size=1,
+                # trust_remote_code=True      # 有的模型需要
+            )
+            self.vllm_sampling_params = SamplingParams(
+                max_tokens=100,              # 你要生成的最大token数
+                temperature=0.5,
+                top_p=1.0,
+            )
+        else:
+            print("[HybridLLMRuleRewardManager] No judge model path provided.")
+            self.judge_tokenizer = None
+            self.judge_model = None
+
         if model_path:
             print(f"[HybridLLMRuleRewardManager] Loading reward LLM from {model_path}")
             special_tokens_dict = {'additional_special_tokens': ['[SEP]']}
             num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
             print(f"Added {num_added_toks} special tokens")
             self.llm_tokenizer = AutoTokenizer.from_pretrained(model_path)
+            # 明确指定reward model到cuda:1
             self.llm_model = QwenWithCTRCVR.from_pretrained(model_path, torch_dtype=torch.float16, attn_implementation="flash_attention_2")
-            self.llm_model = self.llm_model.to(torch.float16)
             self.llm_model.eval()
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.llm_model.to(device)
-            if device == "cuda":
+            reward_model_device = torch.device("cuda:1") if torch.cuda.is_available() and torch.cuda.device_count() > 1 else torch.device("cuda:0")
+            self.llm_model = self.llm_model.to(reward_model_device)
+            if reward_model_device:
                 print("[DEBUG] Model device:", next(self.llm_model.parameters()).device)
                 print("[DEBUG] Model CUDA device id:", next(self.llm_model.parameters()).device.index)
             else:
@@ -204,30 +229,6 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             print("[HybridLLMRuleRewardManager] No black list path provided.")
             self.black_list = None
 
-        if judge_model_path:
-            print(f"[HybridLLMRuleRewardManager] Loading judge model from {judge_model_path}")
-            # self.judge_tokenizer = AutoTokenizer.from_pretrained(judge_model_path)
-            # self.judge_model = AutoModelForCausalLM.from_pretrained(
-            #     judge_model_path,
-            #     torch_dtype=torch.float16,
-            #     device_map="auto"
-            # )
-            # self.judge_model.eval()
-            self.judge_model = LLM(
-                model=judge_model_path,
-                dtype="float16",              # 推荐用float16提升速度
-                max_model_len=2048,           # 视需求调整
-                # trust_remote_code=True      # 有的模型需要
-            )
-            self.vllm_sampling_params = SamplingParams(
-                max_tokens=100,              # 你要生成的最大token数
-                temperature=0.5,
-                top_p=1.0,
-            )
-        else:
-            print("[HybridLLMRuleRewardManager] No judge model path provided.")
-            self.judge_tokenizer = None
-            self.judge_model = None
 
     def map_char_rewards_to_tokens(self,
         response_ids: torch.Tensor,
@@ -556,6 +557,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         pagetitle, bidword = '', ''
         if '__' in refer_message:
             pagetitle, bidword = refer_message.split('__', 1)
+            if "__pbsim" in bidword:
+                bidword = bidword.split('__')[0].strip()
 
         return title, question, answer, pagetitle, bidword, title_start, question_start, answer_start
 
@@ -755,6 +758,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
 
                 for idx, output in zip(batch_indices, outputs):
                     t = output.outputs[0].text.strip()
+                    # print(f"batch_indices:{idx} and output is {t}")
                     label = self.parse_relevance_output(t)  # 解析为具体分数
                     try:
                         relevent_scores[idx] = float(label) / 5
@@ -762,46 +766,6 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                         print(f"sample {idx}: judge_output={t}, label parse failed: {e}")
                         relevent_scores[idx] = 0.0
                     log(f"sample {idx}: judge_output={t}, label={label}")
-        # if self.judge_model is not None:
-        #     valid_indices_and_prompts = [(i, p) for i, p in enumerate(judge_model_inputs) if p is not None]
-        #     if valid_indices_and_prompts:
-        #         batch_size_ = self.judge_model_batch_size
-        #         for start in range(0, len(valid_indices_and_prompts), batch_size_):
-        #             end = start + batch_size_
-        #             batch = valid_indices_and_prompts[start:end]
-        #             batch_indices = [idx for idx, _ in batch]
-        #             batch_prompts = [p for _, p in batch]
-        #             log(f"judge forward batch: {start}-{end}, size={len(batch_prompts)}")
-
-        #             enc = self.judge_tokenizer(
-        #                 batch_prompts,
-        #                 return_tensors="pt",
-        #                 padding=True,
-        #                 truncation=True,
-        #                 max_length=2048,  # 保险起见，限制上下文长度
-        #             )
-        #             device = next(self.judge_model.parameters()).device
-        #             enc = {k: v.to(device) for k, v in enc.items()}
-
-        #             with torch.no_grad():
-        #                 gen = self.judge_model.generate(
-        #                     **enc,
-        #                     do_sample=False,
-        #                     temperature=0.0,
-        #                     max_new_tokens=4,
-        #                     pad_token_id=self.judge_tokenizer.eos_token_id,
-        #                 )
-
-        #             # 解码新生成部分
-        #             input_len = enc["input_ids"].size(1)
-        #             gen_chunk = gen[:, input_len:]
-        #             decoded = self.judge_tokenizer.batch_decode(gen_chunk, skip_special_tokens=True)
-
-        #             for idx, text in zip(batch_indices, decoded):
-        #                 t = text.strip()
-        #                 label = self.parse_relevance_output(t)  # 解析为具体分数
-        #                 relevent_scores[idx] = float(label)/5
-        #                 log(f"sample {idx}: judge_output={t}, label={label}")
             else:
                 log("no valid judge inputs, skip relevance scoring")
 
