@@ -546,26 +546,19 @@ class RayPPOTrainer:
         main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
         val_metrics: Optional[Dict[str, Any]] = None
 
-        log("fit: before _load_checkpoint")
         # load checkpoint before doing anything
         self._load_checkpoint()
         main_tqdm.update(self.global_step)
-        log("fit: after _load_checkpoint")
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.val_before_train:
-            log("fit: before _validate (val_before_train)")
             val_metrics = self._validate()
-            log("fit: after _validate (val_before_train)")
             self.logger.log(data=val_metrics, step=self.global_step)
             if self.config.trainer.val_only:
-                log("fit: val_only True, return")
                 return
 
-        log("fit: before train_dataloader iter")
         self.data_iterator = iter(self.train_dataloader)
-        log("fit: after train_dataloader iter")
         
         while self.global_step < self.training_steps:
             self.global_step += 1
@@ -573,79 +566,58 @@ class RayPPOTrainer:
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
                 # make a batch of data
-                log("fit: before gen")
                 with timer("gen", timing_raw):
-                    log("fit: before prepare_rollout_engine")
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
-                    log("fit: before _make_batch_data")
                     batch = self._make_batch_data(metrics=metrics)
-                    log("fit: before release_rollout_engine")
                     self.actor_rollout_ref_wg.release_rollout_engine()
 
                 # balance the number of valid tokens on each dp rank.
                 # NOTE: this breaks the order of data inside the batch.
                 # Please take care when you implement group based adv computation such as GRPO and rloo
-                log("fit: before _balance_batch")
                 self._balance_batch(batch, metrics=metrics)
 
-                log("fit: before global_token_num")
                 # compute global valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-                log("fit: after global_token_num")
                 # compute reward
                 if "token_level_scores" not in batch.batch:
-                    log("fit: before reward_fn.compute_reward.remote")
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
-                    log("fit: after reward_fn.compute_reward.remote")
 
-                log("fit: before old_log_probs")
                 # recompute old_log_probs
                 with timer("old", timing_raw):
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
-                log("fit: after old_log_probs")
 
                 # compute ref_log_probs
                 if self.use_reference_policy:
-                    log("fit: before ref_log_probs")
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
-                    log("fit: after ref_log_probs")
 
                 # compute values
                 if self.use_critic:
-                    log("fit: before compute_values")
                     with timer("values", timing_raw):
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
-                    log("fit: after compute_values")
 
-                log("fit: before adv")
                 with timer("adv", timing_raw):
                     if "token_level_scores" not in batch.batch:
-                        log("fit: before ray.get(reward_ref)")
                         # get token level scores asynchronously
                         reward_tensor, reward_metrics = ray.get(reward_ref)
-                        log("fit: after ray.get(reward_ref)")
                         batch.batch["token_level_scores"] = reward_tensor
                         reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                         metrics.update(reward_metrics)
 
                     # apply kl penalty if available
                     if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        log("fit: before apply_kl_penalty")
                         # apply kl penalty to reward
                         batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
                         metrics.update(kl_metrics)
-                        log("fit: after apply_kl_penalty")
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                     # compute advantages, executed on the driver process
-                    log("fit: before compute_advantage")
                     batch = compute_advantage(
                         batch,
                         adv_estimator=self.config.algorithm.adv_estimator,
@@ -653,24 +625,19 @@ class RayPPOTrainer:
                         lam=self.config.algorithm.lam,
                         use_token_level_reward=self.config.algorithm.use_token_level_reward
                     )
-                    log("fit: after compute_advantage")
 
                 # update critic
                 if self.use_critic:
-                    log("fit: before update_critic")
                     with timer("update_critic", timing_raw):
                         critic_output = self.critic_wg.update_critic(batch)
-                    log("fit: after update_critic")
 
                     critic_metrics = reduce_metrics(critic_output.non_tensor_batch)
                     metrics.update(critic_metrics)
 
                 # update actor
                 if self.config.trainer.critic_warmup <= self.global_step:
-                    log("fit: before update_actor")
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
-                    log("fit: after update_actor")
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
 
@@ -680,32 +647,23 @@ class RayPPOTrainer:
                     and self.config.trainer.val_freq > 0
                     and self.global_step % self.config.trainer.val_freq == 0
                 ):
-                    log("fit: before validation")
                     with timer("validation", timing_raw):
                         val_metrics = self._validate()
-                    log("fit: after validation")
 
                     metrics.update(val_metrics)
 
                 if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
-                    log("fit: before save_checkpoint")
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
-                    log("fit: after save_checkpoint")
 
             # collect metrics
-            log("fit: before compute_data_metrics")
             num_gpus = self.resource_pool_manager.get_num_gpus()
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
-            log("fit: after compute_data_metrics")
 
-            log("fit: before logger.log")
             self.logger.log(data=metrics, step=self.global_step)
-            log("fit: after logger.log")
             main_tqdm.update()
-            log("fit: step end")
 
         # perform validation after training
         if self.val_reward_fn is not None:
@@ -714,15 +672,10 @@ class RayPPOTrainer:
                 or self.config.trainer.val_freq <= 0
                 or self.global_step % self.config.trainer.val_freq != 0
             ):
-                log("fit: before final validation")
                 val_metrics = self._validate()
                 self.logger.log(data=val_metrics, step=self.global_step)
-                log("fit: after final validation")
 
             print(f"Final validation metrics: {convert_dict_to_str(val_metrics)}")
 
         if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
-            log("fit: before final _save_checkpoint")
             self._save_checkpoint()
-            log("fit: after final _save_checkpoint")
-        log("fit: end")
