@@ -230,11 +230,13 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             self.black_list = None
 
 
-    def map_char_rewards_to_tokens(self,
+    def map_char_rewards_to_tokens(
+        self,
         response_ids: torch.Tensor,
         tokenizer: PreTrainedTokenizer,
         response_str: str,
         char_rewards: List[float],
+        debug: bool = False,
     ) -> torch.Tensor:
         """
         将“逐字符（char-level）分数”映射为“逐 token 分数”。                                                          
@@ -258,8 +260,8 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
             torch.Tensor
                 与 response_ids 等长的 token 级分数张量，dtype=float32，device 与 response_ids 相同。
         """
+
         # ---------- 基本校验 ----------
-        # 保证字符级分数长度与明文长度完全一致，否则无法一一对应。
         if len(response_str) != len(char_rewards):
             raise ValueError(
                 f"[map_char_rewards_to_tokens] Length mismatch: "
@@ -269,9 +271,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         device = response_ids.device
         ids_list = response_ids.tolist()
 
-        # 输出张量，初始化为 0（对 special token 会保留为 0；普通 token 之后填平均分）
         token_rewards = torch.zeros_like(response_ids, dtype=torch.float32)
-
         # ---------- 标记特殊 token ----------
         # special_mask: 与 ids_list 等长，特殊 token 位置为 1；普通 token 为 0
         # already_has_special_tokens=True 表示 ids_list 可能包含 special，需要直接判断。
@@ -282,93 +282,74 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
         except Exception:
             # 某些自定义 tokenizer 可能不支持该函数；保守起见默认全为非特殊
             special_mask = [0] * len(ids_list)
-
         # 记录普通 token 的下标（需要写入分数的位置）
         non_special_indices = [i for i, m in enumerate(special_mask) if m == 0]
 
-        # ---------- Fast 路径：使用 offset mapping ----------
-        # 条件：tokenizer 为 Fast 版本（底层为 tokenizers 库），支持返回每个 token 对应的字符区间
         used_fast_path = False
-        # if getattr(tokenizer, "is_fast", False):
-        #     try:
-        #         # 对 response_str 重新分词，且不引入任何 special tokens
-        #         # 这样得到的 input_ids 和 offset_mapping 是原始明文的纯文本切分
-        #         enc = tokenizer(
-        #             response_str,
-        #             add_special_tokens=False,
-        #             return_offsets_mapping=True
-        #         )
-        #         text_token_ids = enc["input_ids"]                # 纯文本 token id 序列
-        #         offsets = enc["offset_mapping"]                  # 每个 token 对应的 (start, end) 字符下标（左闭右开）
+        # (fast path 暂时保留注释不动)
 
-        #         # 将每个文本 token 的字符区间分数取平均
-        #         text_token_rewards: List[float] = []
-        #         for (start, end) in offsets:
-        #             if end > start:
-        #                 # 平均该区间内的字符分数；注意这里的切片是基于 Python 字符的下标
-        #                 span = char_rewards[start:end]
-        #                 text_token_rewards.append(float(sum(span)) / (end - start))
-        #             else:
-        #                 # 部分 tokenizer 可能产生零宽 token（极少见）；安全起见置 0
-        #                 text_token_rewards.append(0.0)
+        if debug:
+            print("=" * 60)
+            print("[DEBUG] response_str:", repr(response_str))
+            print("[DEBUG] len(response_str):", len(response_str))
+            print("[DEBUG] char_rewards:", char_rewards)
+            print("[DEBUG] response_ids:", ids_list)
+            print("[DEBUG] special_mask:", special_mask)
+            print("[DEBUG] non_special_indices:", non_special_indices)
 
-        #         # 将 response_ids 去掉 special 后得到的 id 序列，与 text_token_ids 对齐：
-        #         # 如果完全一致，说明两边切分一致，可直接把 text_token_rewards 写回到非特殊 token 位置。
-        #         non_special_ids = [ids_list[i] for i in non_special_indices]
-        #         if non_special_ids == text_token_ids:
-        #             for out_pos, r in zip(non_special_indices, text_token_rewards):
-        #                 token_rewards[out_pos] = r
-        #             used_fast_path = True
-        #         # 若不一致，说明重分词与原始 ids 有轻微差异（可能来自空白处理等），转入慢路径兜底。
-        #     except Exception:
-        #         # 某些 tokenizer/输入组合可能不支持 offsets；直接转慢路径
-        #         used_fast_path = False
-
-        # ---------- Slow 路径（兜底）：解码游标法 ----------
-        # 思路：逐 token 解码成字符串片段 piece，然后用一个 cursor 在 response_str 上滑动，
-        # 取与 piece 长度相等的字符分数做平均。这样无需 offsets，也能对齐大多数 BPE/SentencePiece 行为。
+        # ---------- Slow 路径 ----------
         if not used_fast_path:
-            cursor = 0  # 指向 response_str 中尚未消费的起始位置
+            cursor = 0
             n_chars = len(response_str)
 
             for idx, tid in enumerate(ids_list):
                 if special_mask[idx] == 1:
                     # 特殊 token：保持 0 分并跳过
                     token_rewards[idx] = 0.0
+                    if debug:
+                        print(f"[DEBUG] idx={idx}, tid={tid} (SPECIAL), reward=0.0")
                     continue
-
                 # 解码当前单个 token（skip_special_tokens=True 避免把特殊符号文本解出来）
                 piece = tokenizer.decode([tid], skip_special_tokens=True)
-
                 # 片段为空串的情况（偶尔会出现）：给 0 分，不移动光标
                 if not piece:
                     token_rewards[idx] = 0.0
+                    if debug:
+                        print(f"[DEBUG] idx={idx}, tid={tid}, piece='', reward=0.0")
                     continue
-
-                piece_len = len(piece)
-
                 # 理想情况下：response_str[cursor : cursor + piece_len] 恰好等于 piece。
                 # 为了保持 O(N) 线性时间，这里不做复杂的查找/对齐，仅按长度切分。
                 # 这在 GPT2 系列（空白以空格还原）、SentencePiece（'▁' 还原为空格）等常见 tokenizer 中可用。
+                piece_len = len(piece)
                 start = cursor
                 end = min(cursor + piece_len, n_chars)
 
                 if start >= n_chars:
                     # 安全保护：游标已到达尾部（这通常意味着上游长度不一致）
                     token_rewards[idx] = 0.0
+                    if debug:
+                        print(f"[DEBUG] idx={idx}, tid={tid}, cursor {cursor} >= n_chars, reward=0.0")
                 else:
                     span = char_rewards[start:end]
                     if span:
-                        token_rewards[idx] = float(sum(span)) / len(span)
+                        reward_val = float(sum(span)) / len(span)
                     else:
-                        token_rewards[idx] = 0.0
+                        reward_val = 0.0
+                    token_rewards[idx] = reward_val
 
+                    if debug:
+                        print(f"[DEBUG] idx={idx}, tid={tid}, piece={repr(piece)}, "
+                            f"cursor=({start}:{end}), span={span}, reward={reward_val}")
                 # 按 piece 的可见字符长度推进游标
                 cursor = end
 
             # 可选的健壮性检查（不抛错，只在你需要时日志提示）：
             # if cursor != n_chars:
             #     print(f"[map_char_rewards_to_tokens] Warning: cursor({cursor}) != len(response_str)({n_chars}).")
+            if debug:
+                print(f"[DEBUG] Final cursor={cursor}, n_chars={n_chars}")
+                print("[DEBUG] Final token_rewards:", token_rewards.tolist())
+                print("=" * 60)
 
         return token_rewards.to(device)
 

@@ -194,49 +194,43 @@ def compute_grpo_outcome_advantage(
 # NOTE(sgm): this implementation consider process supervision
 @torch.no_grad()
 def compute_grpo_outcome_advantage_token(
-    token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: torch.Tensor, eps: float = 1e-6
+    token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index, eps: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute process-level (token-level) advantages for GRPO.
-
-    Args:
-        token_level_rewards: (torch.Tensor) shape: (bs, response_length)
-        response_mask: (torch.Tensor) shape: (bs, response_length)
-        index: (torch.Tensor) shape: (bs,)
-        eps: (float) epsilon to avoid division by zero
-
-    Returns:
-        advantages: (torch.Tensor) shape: (bs, response_length)
-        returns: (torch.Tensor) shape: (bs, response_length)
+    Directly normalize token rewards at the group level.
     """
-    # step 1: 计算 rollout 内的 scores
-    scores = token_level_rewards.mean(dim=-1)  # (bs,)
+    bsz, seq_len = token_level_rewards.shape
 
-    id2score = defaultdict(list)
-    id2mean, id2std = {}, {}
-
-    bsz = scores.shape[0]
+    # 收集 group 内的所有 token reward（去掉 padding）
+    id2tokens = defaultdict(list)
     for i in range(bsz):
-        id2score[index[i]].append(scores[i])
+        valid_rewards = token_level_rewards[i][response_mask[i] > 0]
+        # 兼容 str / int / tensor
+        group_id = index[i] if isinstance(index[i], str) else int(index[i].item())
+        id2tokens[group_id].append(valid_rewards)
 
-    for idx in id2score:
-        assert len(id2score[idx]) > 1, "GRPO needs rollout.n > 1."
-        group_scores = torch.tensor(id2score[idx], device=scores.device, dtype=scores.dtype)
-        id2mean[idx] = torch.mean(group_scores)
-        id2std[idx] = torch.std(group_scores)
+    id2mean, id2std = {}, {}
+    for idx, rewards_list in id2tokens.items():
+        group_rewards = torch.cat(rewards_list, dim=0)
+        assert group_rewards.numel() > 1, "GRPO needs more than one token per group."
+        id2mean[idx] = group_rewards.mean()
+        id2std[idx] = group_rewards.std()
 
-    # step 2: 逐 token reward 做标准化
+    # 标准化
     advantages = torch.zeros_like(token_level_rewards)
     for i in range(bsz):
-        mean = id2mean[index[i]]
-        std = id2std[index[i]]
+        group_id = index[i] if isinstance(index[i], str) else int(index[i].item())
+        mean, std = id2mean[group_id], id2std[group_id]
         advantages[i] = (token_level_rewards[i] - mean) / (std + eps)
 
-    # mask 掉 padding 部分
+    # mask padding
     advantages = advantages * response_mask
-    returns = advantages  # GRPO 用 returns=advantages
+    returns = advantages
 
     return advantages, returns
+
+
 
 @torch.no_grad()
 def compute_rloo_outcome_advantage(
