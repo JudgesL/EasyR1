@@ -31,7 +31,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
 from collections import Counter
-from .prompts import PROMPT_BASE
+from .prompts import PROMPT_BASE, PROMPT_NEW
 from vllm import LLM, SamplingParams
 
 class RewardInput(TypedDict):
@@ -191,7 +191,7 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 # trust_remote_code=True      # 有的模型需要
             )
             self.vllm_sampling_params = SamplingParams(
-                max_tokens=100,              # 你要生成的最大token数
+                max_tokens=500,              # 你要生成的最大token数
                 temperature=0.5,
                 top_p=1.0,
             )
@@ -563,11 +563,31 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 score = 0
         return score
 
+    def parse_relevance_output_01(self, text: str) -> int:
+        """
+        解析 judge model 的输出文本，提取【相关性】分数（int）
+        
+        输出格式要求：
+        【相关性】：具体分数，如（0分、1分）
+        【理由】：具体理由
+        """
+        score = 0
+        if not text:
+            return score
+        # 提取相关性分数（只允许 0 或 1）
+        score_match = re.search(r"【相关性】\s*[:：]?\s*([01])分", text)
+        if score_match:
+            try:
+                score = int(score_match.group(1))
+            except ValueError:
+                score = 0
+        return score
+
     def model_output_to_judge_input_qwen(self, title, question, answer, bidword) -> str:
         """
         输入给judge model判断相关性
         """
-        reward_input = (PROMPT_BASE,
+        reward_input = (PROMPT_NEW,
             f"广告主买词：{bidword}",
             f"广告内容：",
             f"【卡片标题】：{title}",
@@ -740,9 +760,9 @@ class HybridLLMRuleRewardManager(FunctionRewardManager):
                 for idx, output in zip(batch_indices, outputs):
                     t = output.outputs[0].text.strip()
                     # print(f"batch_indices:{idx} and output is {t}")
-                    label = self.parse_relevance_output(t)  # 解析为具体分数
+                    label = self.parse_relevance_output_01(t)  # 解析为具体分数
                     try:
-                        relevent_scores[idx] = float(label) / 5
+                        relevent_scores[idx] = float(label)
                     except Exception as e:
                         print(f"sample {idx}: judge_output={t}, label parse failed: {e}")
                         relevent_scores[idx] = 0.0
