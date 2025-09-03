@@ -44,6 +44,8 @@ class RewardConfig:
     # diversity
     n_gram_low_bound: int = 2
     n_gram_up_bound: int = 5
+    n_gram_low_bound_title: int = 1
+    n_gram_up_bound_title: int = 5
     n_gram_threshold: float = 0.15
     ngram_penalty: float = 0.1
     # black list
